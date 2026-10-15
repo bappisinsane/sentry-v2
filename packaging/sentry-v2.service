@@ -1,0 +1,70 @@
+[Unit]
+Description=Sentry-v2 pressure, failure and SELinux denial monitor
+Documentation=https://github.com/jamesconwaydev/sentry-v2
+After=dbus.service systemd-journald.service auditd.service
+Wants=dbus.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=/usr/bin/sentry-v2
+ExecReload=/bin/kill -HUP $MAINPID
+WatchdogSec=30s
+Restart=on-failure
+RestartSec=5s
+# On stop the daemon rolls back every active throttle and freeze. Each one
+# can take 10 attempts: 243s of backoff plus 10 D-Bus timeouts of 10s. The
+# retries overlap but D-Bus calls are serialised, so 5 active actions (the
+# max_active_actions default) need up to 243s + 5 * 100s = 743s. Raise this
+# if you raise max_active_actions.
+TimeoutStopSec=780s
+
+Slice=system.slice
+MemoryMin=48M
+MemoryMax=192M
+OOMScoreAdjust=-900
+CPUWeight=1000
+
+StateDirectory=sentry-v2
+StateDirectoryMode=0700
+# systemd chowns the runtime directory to the service's group at start, so
+# the group has to be set here for sentry-v2 members to reach the socket.
+# Admins need both groups: sentry-v2 to get through the directory and
+# sentry-v2-admin to change anything (usermod -aG sentry-v2,sentry-v2-admin <you>).
+Group=sentry-v2
+RuntimeDirectory=sentry-v2
+RuntimeDirectoryMode=0750
+ConfigurationDirectory=sentry-v2
+# Secrets can come from systemd credentials instead of files under /etc:
+#LoadCredential=webhook-hmac:/etc/sentry-v2/hmac.key
+
+# Runs as root, but with only these capabilities. CAP_AUDIT_READ reads the
+# audit multicast stream, CAP_SYS_PTRACE reads /proc of other services and
+# CAP_DAC_READ_SEARCH reads unit drop-ins and journals regardless of mode.
+CapabilityBoundingSet=CAP_AUDIT_READ CAP_SYS_PTRACE CAP_DAC_READ_SEARCH
+NoNewPrivileges=yes
+ProtectSystem=strict
+# PSI triggers are registered by writing to <cgroup>/*.pressure. The state
+# directory is writable through StateDirectory= anyway; it's listed so
+# every writable path shows up in one place.
+ReadWritePaths=/var/lib/sentry-v2 /sys/fs/cgroup
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target
