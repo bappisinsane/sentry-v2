@@ -15,7 +15,7 @@ from typing import Any
 import pytest
 
 from contracts import NGINX
-from sentry_v2 import __version__, actions, daemon
+from sentry_v2 import __version__, actions, commands, daemon
 from sentry_v2.cgroupfs import CgroupFS
 from sentry_v2.collectors.audit import parse_audit_text
 from sentry_v2.control import CommandError
@@ -155,12 +155,12 @@ class Env:
             return FakeReader(entries, [])
 
         kw.setdefault("audit_source_factory", lambda: FakeSource(self.audit_records))
+        kw.setdefault("clock", time.time)
         return Daemon(
             (self.config, self.policies),
             fs=self.fs,
             mgr_factory=lambda: self.mgr,
             journal_reader_factory=reader,
-            clock=time.time,
             notify=self.notes.append,
             **kw,
         )
@@ -367,6 +367,47 @@ def test_crashing_collector_is_restarted_with_backoff(env: Env) -> None:
     drive(d, body)
 
 
+def test_slow_replay_keeps_extending_the_start_timeout(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(daemon, "EXTEND_EVERY", 0.05)
+    d = env.daemon()
+
+    async def slow_replay() -> None:
+        await asyncio.sleep(0.3)
+
+    monkeypatch.setattr(d.executor, "replay", slow_replay)
+
+    async def body() -> None:
+        await asyncio.sleep(0.2)  # long enough for more pings, had they not stopped
+
+    drive(d, body)
+    ready = env.notes.index("READY=1")
+    assert env.notes[:ready].count(daemon.EXTEND_TIMEOUT) >= 3
+    assert daemon.EXTEND_TIMEOUT not in env.notes[ready:]
+
+
+def test_ticker_compacts_the_action_journal_daily(env: Env) -> None:
+    now = [time.time()]
+    d = env.daemon(clock=lambda: now[0])
+    path = env.state / "state" / "actions.jsonl"
+    old = ActionJournal(path, clock=lambda: now[0] - 8 * 86400)
+    rec = ActionRecord(
+        id="old", policy="p", action="throttle", target="nginx.service", mode="enforce",
+        status="rolled_back", previous={}, applied_at=1.0, expires_at=2.0, error=None,
+        incident_id="i1",
+    )  # fmt: skip
+
+    async def body() -> None:
+        old.append(rec)  # after startup's compaction
+        await asyncio.sleep(0.6)
+        assert "old" in d.executor.journal.load()
+        now[0] += daemon.COMPACT_EVERY
+        await wait_for(lambda: "old" not in d.executor.journal.load())
+
+    drive(d, body)
+
+
 def test_replay_runs_before_collectors_start(env: Env) -> None:
     order: list[str] = []
     frozen = dataclasses.replace(NGINX, freezer_state="frozen")
@@ -551,7 +592,15 @@ def test_incidents_filters_and_show_errors(env: Env) -> None:
     drive(d, body)
 
 
-def test_restore(env: Env) -> None:
+@pytest.fixture
+def unit_roots(env: Env, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Stands in for /etc/systemd/system, the one tree restore may write."""
+    etc = env.root / "etc"
+    monkeypatch.setattr(commands, "RESTORE_ROOTS", (etc,))
+    return etc
+
+
+def test_restore(env: Env, unit_roots: Path) -> None:
     unit_file = env.root / "etc" / "demo.service"
     unit_file.parent.mkdir()
     unit_file.write_text("[Service]\nExecStart=/bin/true\n")
@@ -565,6 +614,7 @@ def test_restore(env: Env) -> None:
         r = await cmd.restore({"backup_id": backup_id})
         assert r == {
             "restored": [str(unit_file)],
+            "skipped": [],
             "note": "run systemctl daemon-reload && systemctl reload demo.service",
         }
         assert unit_file.read_text() == "[Service]\nExecStart=/bin/true\n"
@@ -594,7 +644,9 @@ def test_restore(env: Env) -> None:
     drive(d, body)
 
 
-def test_restore_does_not_copy_the_backups_label(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_restore_does_not_copy_the_backups_label(
+    env: Env, unit_roots: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     # copystat would stamp the backup's SELinux label on the restored unit
     # file, and the daemon's domain may not relabel files anyway
     def denied(*_a: object, **_k: object) -> None:
@@ -613,6 +665,70 @@ def test_restore_does_not_copy_the_backups_label(env: Env, monkeypatch: pytest.M
         assert (await d.commands.restore({"backup_id": backup_id}))["restored"] == [str(unit_file)]
         assert unit_file.read_text() == "[Service]\n"
         assert unit_file.stat().st_mtime == 1000
+
+    drive(d, body)
+
+
+def _vendor_unit_with_drop_in(env: Env) -> tuple[Path, Path, Daemon, str]:
+    """A package's unit outside the writable roots plus an admin drop-in, backed up."""
+    fragment = env.root / "usr" / "demo.service"
+    fragment.parent.mkdir()
+    fragment.write_text("[Service]\nExecStart=/bin/true\n")
+    drop_in = env.root / "etc" / "demo.service.d" / "override.conf"
+    drop_in.parent.mkdir(parents=True)
+    drop_in.write_text("[Service]\nNice=5\n")
+    d = env.daemon()
+    files = [str(fragment), str(drop_in)]
+    return fragment, drop_in, d, actions.backup("demo.service", files, d.executor.backups_dir, 0.0)
+
+
+def test_restore_skips_unchanged_files_outside_the_unit_dirs(env: Env, unit_roots: Path) -> None:
+    fragment, drop_in, d, backup_id = _vendor_unit_with_drop_in(env)
+    drop_in.write_text("broken")
+
+    async def body() -> None:
+        r = await d.commands.restore({"backup_id": backup_id})
+        assert r["restored"] == [str(drop_in)]
+        assert r["skipped"] == [str(fragment)]
+        assert drop_in.read_text() == "[Service]\nNice=5\n"
+
+        r = await d.commands.restore({"backup_id": backup_id})
+        assert (r["restored"], r["skipped"]) == ([], [str(fragment), str(drop_in)])
+        assert "nothing to do" in r["note"]
+
+    drive(d, body)
+
+
+def test_restore_refuses_changed_files_outside_the_unit_dirs(env: Env, unit_roots: Path) -> None:
+    fragment, drop_in, d, backup_id = _vendor_unit_with_drop_in(env)
+    fragment.write_text("vendor update")
+    drop_in.write_text("broken")
+
+    async def body() -> None:
+        with pytest.raises(CommandError) as e:
+            await d.commands.restore({"backup_id": backup_id})
+        msg = str(e.value)
+        assert msg.startswith("nothing restored")
+        assert str(fragment) in msg and str(drop_in) not in msg
+        assert f"{d.executor.backups_dir / backup_id}/files" in msg
+        assert (fragment.read_text(), drop_in.read_text()) == ("vendor update", "broken")
+
+    drive(d, body)
+
+
+def test_restore_recreates_a_removed_drop_in_directory(env: Env, unit_roots: Path) -> None:
+    _fragment, drop_in, d, backup_id = _vendor_unit_with_drop_in(env)
+    shutil.rmtree(drop_in.parent)
+
+    async def body() -> None:
+        old = os.umask(0o077)  # the unit's UMask
+        try:
+            r = await d.commands.restore({"backup_id": backup_id})
+        finally:
+            os.umask(old)
+        assert r["restored"] == [str(drop_in)]
+        assert drop_in.read_text() == "[Service]\nNice=5\n"
+        assert drop_in.parent.stat().st_mode & 0o777 == 0o755
 
     drive(d, body)
 
@@ -715,6 +831,39 @@ async def scrape(port: int) -> str:
     data = await reader.read()
     writer.close()
     return data.decode()
+
+
+def test_metrics_show_stuck_rollbacks_and_the_breaker(env: Env) -> None:
+    journal = ActionJournal(env.state / "state" / "actions.jsonl")
+    for rec_id in ("s1", "s2"):  # two failed rollbacks, one stuck target
+        journal.append(
+            ActionRecord(
+                id=rec_id,
+                policy="p",
+                action="freeze",
+                target="nginx.service",
+                mode="enforce",
+                status="rollback_failed",
+                previous={},
+                applied_at=1.0,
+                expires_at=2.0,
+                error="timeout",
+                incident_id="i1",
+            )
+        )
+    port = free_port()
+    env.write_config(f"[metrics]\nenabled = true\nport = {port}\n")
+    d = env.daemon()
+
+    async def body() -> None:
+        text = await scrape(port)
+        assert "sentry_v2_rollbacks_stuck 1.0" in text
+        assert "sentry_v2_breaker_open 0.0" in text
+        for _ in range(d.cfg.limits.breaker_failures):
+            d.executor._apply_failed()
+        assert "sentry_v2_breaker_open 1.0" in await scrape(port)
+
+    drive(d, body)
 
 
 FREEZE_POLICY = """

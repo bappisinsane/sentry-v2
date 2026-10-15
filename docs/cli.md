@@ -133,8 +133,9 @@ first. The recent list is kept in memory and starts empty after a
 restart; the full history is in `/var/lib/sentry-v2/state/actions.jsonl`. The `WHEN`
 column shows the expiry when a record has one and the record time
 otherwise.
-The `ID` column shows the first 8 characters; `--json` has the full ids,
-which `rollback` needs.
+The `ID` column shows the last 8 characters of each id. The first ones are
+a timestamp, so actions taken in the same second would look alike; the end
+is random. `--json` has the full ids.
 
 ### policies
 
@@ -152,7 +153,11 @@ unit-failure-notify       dry-run  dry-run    unit_failed  notify            /et
 
 ### rollback ID | --all
 
-Undo an action now. Give either an action id or `--all`.
+Undo an action now. Give either an action id or `--all`. You don't have to
+type the whole id: any 6 or more characters from its start or end will do,
+such as the 8 in the `actions` table, as long as they match just one action
+in the `actions` output. If they match several, you get the full ids to
+choose from. An action older than the last 100 records needs its full id.
 
 | Form | Effect |
 |---|---|
@@ -160,11 +165,15 @@ Undo an action now. Give either an action id or `--all`.
 | `rollback --all` | Roll back every active throttle and freeze. |
 
 ```console
-$ sentry-v2ctl rollback --all
+$ sentry-v2ctl rollback 4d5c6b7a
 rolled back 0199f2b4-1d2e-7a00-8c11-2f3e4d5c6b7a  throttle on batch-report.service
 ```
 
 An unknown id fails with `error: no such action` and exit code 1.
+
+A rollback retries for minutes when systemd is slow to answer, so
+`rollback` and `restore` wait up to 15 minutes for the daemon's reply
+where other commands give up after 10 seconds.
 
 ### pause, resume
 
@@ -191,22 +200,38 @@ $ sentry-v2ctl restore app-web.service/20261014T031502Z
 
 Before writing anything, the daemon checks every file against the backup's
 `MANIFEST.sha256` and refuses a backup directory that isn't owned by root
-or is writable by anyone else. It then puts each file back atomically and
-prints the paths, followed by what to run next:
+or is writable by anyone else. Files that still match the backup are left
+alone. The rest go back atomically, and a drop-in directory removed since
+the backup is recreated (mode 0755). You get the paths and what to run
+next:
 
 ```text
 restored:
-/etc/systemd/system/app-web.service
 /etc/systemd/system/app-web.service.d/override.conf
+already matched the backup:
+/usr/lib/systemd/system/app-web.service
 run systemctl daemon-reload && systemctl reload app-web.service
 ```
 
-It doesn't reload anything itself. The unit's sandbox only lets the daemon
-write under `/etc/systemd/system` and `/run/systemd/system`. A backed-up
-file anywhere else, such as one from a policy's `paths`, makes the restore
-stop with `Read-only file system` once it reaches that file; the error
-lists what was restored before it. Copy such files back by hand from the
-backup directory.
+It doesn't reload anything itself.
+
+The unit's sandbox only lets the daemon write under `/etc/systemd/system`
+and `/run/systemd/system`. A package's unit file lives in
+`/usr/lib/systemd/system`, and that's fine as long as it hasn't changed. If
+a file outside those two directories has changed since the backup (a
+package update, or something from a policy's `paths`), the restore writes
+nothing at all and says which files and where the backup is:
+
+```text
+error: nothing restored: changed since the backup and outside
+/etc/systemd/system and /run/systemd/system, where sentry-v2 cannot write:
+/usr/lib/systemd/system/app-web.service. Copy them back by hand from
+/var/lib/sentry-v2/backups/app-web.service/20261014T031502Z/files and run
+the restore again.
+```
+
+Copy those files back, then run the same `restore`; the files you copied
+now match and are skipped.
 
 ## Offline commands
 

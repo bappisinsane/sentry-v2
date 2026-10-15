@@ -34,8 +34,10 @@ def test_unit_file_hardening() -> None:
         "NotifyAccess": "main",
         "WatchdogSec": "30s",
         "Restart": "on-failure",
+        "RestartPreventExitStatus": "2",
         "ExecStart": "/usr/bin/sentry-v2",
         "TimeoutStopSec": "780s",
+        "TimeoutStartSec": "780s",
         "NoNewPrivileges": "yes",
         "ProtectSystem": "strict",
         "ProtectHome": "yes",
@@ -66,6 +68,12 @@ def test_spec_version_matches_package() -> None:
     m = re.search(r"^%global upstream_version (\S+)$", spec, re.MULTILINE)
     assert m is not None and m.group(1) == sentry_v2.__version__
     assert re.search(r"^Version:\s+%\{upstream_version\}$", spec, re.MULTILINE)
+
+
+def test_selinux_module_version_matches_package() -> None:
+    te = (PACKAGING / "selinux" / "sentry_v2.te").read_text()
+    m = re.search(r"^policy_module\(sentry_v2, *([^)\s]+)\)$", te, re.MULTILINE)
+    assert m is not None and m.group(1) == sentry_v2.__version__
 
 
 def test_spec_ships_every_cockpit_file() -> None:

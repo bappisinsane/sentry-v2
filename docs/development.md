@@ -103,9 +103,10 @@ build output.
 
 ## Releasing
 
-1. Set the version in two places: `__version__` in
-   `src/sentry_v2/__init__.py` and `upstream_version` in
-   `packaging/sentry-v2.spec`. A unit test fails if they differ.
+1. Set the version in three places: `__version__` in
+   `src/sentry_v2/__init__.py`, `upstream_version` in
+   `packaging/sentry-v2.spec` and `policy_module(sentry_v2, ...)` in
+   `packaging/selinux/sentry_v2.te`. A unit test fails if they differ.
 2. Add a `%changelog` entry to the spec.
 3. In `CHANGELOG.md`, rename `## [Unreleased]` to the version and date, and
    start a new empty `Unreleased` section.
@@ -119,11 +120,12 @@ build output.
 
    The tag builds and publishes the GitHub release. The release workflow
    accepts only `vMAJOR.MINOR.PATCH` tags, checks that the tag,
-   `__version__` and the spec agree, takes the notes from the matching
+   `__version__`, the spec and the SELinux module agree, takes the notes from the matching
    `CHANGELOG.md` section, builds the RPMs, wheel and sdist, writes
    `SHA256SUMS`, attests their provenance, and creates the release with
    all of them attached.
 
-   Publishing to PyPI is configured in the same workflow but is waiting for
-   the first upload; until then the Python packages are only on the GitHub
-   release.
+   The same workflow can upload the wheel and sdist to PyPI through trusted
+   publishing. That job runs once the maintainer has set up the trusted
+   publisher on PyPI and set the repository variable `PYPI_PUBLISH` to
+   `true`. Until then the Python packages are only on the GitHub release.

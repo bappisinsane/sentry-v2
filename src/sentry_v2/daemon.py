@@ -35,7 +35,14 @@ from .control import ControlServer
 from .correlate import Correlator
 from .events import EventQueue, Incident, PsiEvent, UnitEvent
 from .executor import Executor
-from .metrics import ACTIONS_ACTIVE, PSI_AVG10, MetricsServer, build_registry
+from .metrics import (
+    ACTIONS_ACTIVE,
+    BREAKER_OPEN,
+    PSI_AVG10,
+    ROLLBACKS_STUCK,
+    MetricsServer,
+    build_registry,
+)
 from .policy import Policy, PolicyEngine, PsiWhen, effective_mode
 from .reporting import Reporter
 from .sinks import Sink, SinkError, SinkManager, build_sinks
@@ -51,8 +58,13 @@ BUNDLE_DRAIN = 5.0  # shutdown waits this long for bundles still being built
 # mean the cgroup is gone, so psi and the metrics stop showing it.
 SAMPLE_TTL = 15.0
 INCIDENT_HISTORY = 500
+COMPACT_EVERY = 86400.0  # the action journal, besides once at startup
 RECENT_ACTIONS = 100
 MUTATING = {"rollback", "pause", "resume", "reload", "restore"}
+# Replay can outlast TimeoutStartSec (see the executor's worst case), so
+# while it runs systemd is asked for another minute every half minute.
+EXTEND_EVERY = 30.0
+EXTEND_TIMEOUT = "EXTEND_TIMEOUT_USEC=60000000"
 
 
 def sd_notify(state: str) -> None:
@@ -151,6 +163,7 @@ class Daemon:
         self._psi: PsiCollector | None = None
         self._stopping = False
         self._incident_count = 0
+        self._next_compact = 0.0
         self._seen_dropped: Counter[str] = Counter()
         self._seen_failures: Counter[str] = Counter()
 
@@ -176,6 +189,14 @@ class Daemon:
         self.registry.gauge_func(
             ACTIONS_ACTIVE, "Throttles and freezes awaiting rollback.",
             lambda: [({}, len(self.executor.active()))],
+        )  # fmt: skip
+        self.registry.gauge_func(
+            ROLLBACKS_STUCK, "Targets whose rollback failed and that refuse new actions.",
+            lambda: [({}, len({r.target for r in self.executor.stuck()}))],
+        )  # fmt: skip
+        self.registry.gauge_func(
+            BREAKER_OPEN, "1 while the circuit breaker forces dry-run.",
+            lambda: [({}, int(self.executor.breaker_state()["open"]))],
         )  # fmt: skip
         self.metrics_server = (
             MetricsServer(self.registry, cfg.metrics.host, cfg.metrics.port)
@@ -215,7 +236,12 @@ class Daemon:
         for sig, fn in handlers.items():
             loop.add_signal_handler(sig, fn)
         try:
-            await self.executor.replay()
+            extend = asyncio.create_task(self._extend_start_timeout())
+            try:
+                await self.executor.replay()
+            finally:
+                extend.cancel()
+            self._next_compact = self.clock() + COMPACT_EVERY
             self.sinks.start()
             if self.metrics_server is not None:
                 await self.metrics_server.start()
@@ -266,6 +292,11 @@ class Daemon:
         self._tasks.discard(task)
         if not task.cancelled() and (e := task.exception()) is not None:
             log.error("task %s failed", task.get_name(), exc_info=e)
+
+    async def _extend_start_timeout(self) -> None:
+        while True:
+            self._notify(EXTEND_TIMEOUT)
+            await asyncio.sleep(EXTEND_EVERY)
 
     async def _watchdog(self, interval: float) -> None:
         while True:  # on the main loop, so a hung loop stops the pings
@@ -358,6 +389,9 @@ class Daemon:
                 self.samples = {k: s for k, s in self.samples.items() if s.ts_us >= horizon}
                 self.reporter.prune()
                 self._sync_counters()
+                if now >= self._next_compact:
+                    self._next_compact = now + COMPACT_EVERY  # a failure waits a day too
+                    await self.executor.compact()
             except Exception:
                 log.exception("correlator tick failed")
 

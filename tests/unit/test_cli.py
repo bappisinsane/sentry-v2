@@ -2,6 +2,7 @@ import contextlib
 import json
 import shutil
 import socket
+import sys
 import tempfile
 import threading
 from pathlib import Path
@@ -97,15 +98,49 @@ def test_status_json(stub, capsys):
     assert rc == 0 and json.loads(out) == STATUS
 
 
+ID_A = "0199f2b4-1d2e-7a00-8c11-2f3e4d5c6b7a"
+ID_B = "0199f2b4-1d2e-7a00-9d22-3f4e5d6c7b8a"  # same timestamp bits as ID_A
+
+
 def test_rollback_ok_and_err(stub, capsys):
-    stub.replies["rollback"] = {"ok": True, "result": {"rolled_back": [{"id": "a1"}]}}
-    rc, out, _ = run(stub, capsys, "rollback", "a1")
-    assert rc == 0 and "a1" in out and stub.seen[-1]["args"] == {"id": "a1"}
+    stub.replies["rollback"] = {"ok": True, "result": {"rolled_back": [{"id": ID_A}]}}
+    rc, out, _ = run(stub, capsys, "rollback", ID_A)
+    assert rc == 0 and ID_A in out and stub.seen[-1]["args"] == {"id": ID_A}
+    assert [r["cmd"] for r in stub.seen] == ["rollback"]  # a full id needs no lookup
     stub.replies["rollback"] = {"ok": False, "error": "no such action"}
-    rc, _, err = run(stub, capsys, "rollback", "zz")
+    rc, _, err = run(stub, capsys, "rollback", ID_B)
     assert rc == 1 and "no such action" in err
     run(stub, capsys, "rollback", "--all")
     assert stub.seen[-1]["args"] == {"all": True}
+
+
+def test_rollback_resolves_a_short_id(stub, capsys):
+    stub.replies["actions"] = {
+        "ok": True,
+        "result": {"active": [{"id": ID_A}], "recent": [{"id": ID_A}, {"id": ID_B}]},
+    }
+    stub.replies["rollback"] = {"ok": True, "result": {"rolled_back": [{"id": ID_A}]}}
+    for short in ("2f3e4d5c6b7a", "4d5c6b7a", "0199f2b4-1d2e-7a00-8c", "4D5C6B7A"):
+        rc, _, err = run(stub, capsys, "rollback", short)
+        assert rc == 0, err
+        assert stub.seen[-1] == {"id": 1, "cmd": "rollback", "args": {"id": ID_A}}
+
+    rc, _, err = run(stub, capsys, "rollback", "0199f2b4")
+    assert rc == 1 and ID_A in err and ID_B in err and "more than one" in err
+    rc, _, err = run(stub, capsys, "rollback", "ffffff")
+    assert rc == 1 and "no recent action" in err
+    seen = len(stub.seen)
+    rc, _, err = run(stub, capsys, "rollback", "6b7a")
+    assert rc == 1 and "at least 6" in err and len(stub.seen) == seen
+
+
+def test_id_column_shows_the_random_end_of_the_id(stub, capsys):
+    stub.replies["actions"] = {
+        "ok": True,
+        "result": {"active": [], "recent": [{"id": ID_A}, {"id": ID_B}]},
+    }
+    _, out, _ = run(stub, capsys, "actions")
+    assert "4d5c6b7a" in out and "5d6c7b8a" in out and "0199f2b4" not in out
 
 
 def test_simple_commands(stub, capsys):
@@ -113,7 +148,10 @@ def test_simple_commands(stub, capsys):
         "pause": {"ok": True, "result": {"paused": True}},
         "resume": {"ok": True, "result": {"paused": False}},
         "reload": {"ok": True, "result": {"reloaded": True}},
-        "restore": {"ok": True, "result": {"restored": ["/etc/x"], "note": "reload it"}},
+        "restore": {
+            "ok": True,
+            "result": {"restored": ["/etc/x"], "skipped": ["/usr/y"], "note": "reload it"},
+        },
         "psi": {
             "ok": True,
             "result": {
@@ -170,6 +208,8 @@ def test_simple_commands(stub, capsys):
     ]:
         rc, out, _ = run(stub, capsys, *argv)
         assert rc == 0 and needle in out, argv
+    _, out, _ = run(stub, capsys, "restore", "u.service/20260101T000000Z")
+    assert out == "restored:\n/etc/x\nalready matched the backup:\n/usr/y\nreload it\n"
     rc, out, _ = run(stub, capsys, "top", "--once", "--sort", "cgroup")
     assert out.index("\na ") < out.index("\nb ")
     assert stub.seen[-1]["cmd"] == "psi"
@@ -397,3 +437,28 @@ def test_policies(stub, capsys):
     assert "last reload failed: 99-bad.toml: policy[0].when.bogus" in out
     rc, out, _ = run(stub, capsys, "policies", "--json")
     assert rc == 0 and json.loads(out) == POLICIES
+
+
+def test_rollback_and_restore_wait_longer(stub, capsys, monkeypatch):
+    timeouts: dict[str, float] = {}
+    real_call = ControlClient.call
+
+    def spy(self, cmd, **args):
+        timeouts[cmd] = self.timeout
+        return real_call(self, cmd, **args)
+
+    monkeypatch.setattr(ControlClient, "call", spy)
+    stub.replies |= {
+        "rollback": {"ok": True, "result": {"rolled_back": []}},
+        "restore": {"ok": True, "result": {"restored": [], "skipped": [], "note": "n"}},
+        "pause": {"ok": True, "result": {"paused": True}},
+    }
+    _, _, err = run(stub, capsys, "rollback", "--all")
+    assert err == ""  # not a terminal
+    run(stub, capsys, "restore", "u.service/20260101T000000Z")
+    run(stub, capsys, "pause")
+    assert timeouts == {"rollback": 900.0, "restore": 900.0, "pause": 10.0}
+
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    _, _, err = run(stub, capsys, "rollback", "--all")
+    assert err == "Rolling back… this can take a while if systemd is slow\n"

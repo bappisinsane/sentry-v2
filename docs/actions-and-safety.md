@@ -78,11 +78,16 @@ $ sentry-v2ctl restore app-web.service/20261014T031502Z
 
 The daemon checks every file against the manifest first and refuses the
 whole restore on a mismatch, or if the backup directory isn't owned by root
-or is writable by anyone else. Then it writes each file back atomically and
-tells you what to run next, `systemctl daemon-reload && systemctl reload
-<unit>`. It never reloads anything itself. Restore only writes under
-`/etc/systemd/system` and `/run/systemd/system`; copy anything from `paths`
-back by hand (see [cli.md](cli.md#restore-backup_id)).
+or is writable by anyone else. Files that still match the backup are
+skipped; the rest go back atomically, and you're told what to run next,
+`systemctl daemon-reload && systemctl reload <unit>`. It never reloads
+anything itself.
+
+Restore only writes under `/etc/systemd/system` and `/run/systemd/system`.
+An unchanged package unit in `/usr/lib/systemd/system` is simply skipped.
+If a file elsewhere has changed, though, the restore writes nothing and
+lists those files so you can copy them back by hand from the backup (see
+[cli.md](cli.md#restore-backup_id)).
 
 ## What happens to each action
 
@@ -130,14 +135,22 @@ every active throttle and freeze before it exits.
 ### How long a stop can take
 
 One rollback makes up to 10 attempts with 1, 2, 4, 8, 16, 32, 60, 60 and 60
-seconds between them: 243 s of backoff. Each attempt can also wait up to
-10 s for D-Bus, so one record can take about 343 s. Retries for different
-records overlap, but D-Bus calls go one at a time, so N records that all
-time out take at most 243 s + N × 100 s.
+seconds between them: 243 s of backoff. Each attempt talks to systemd over
+D-Bus, and every call can wait up to 10 s. Thawing a freeze is one call.
+Restoring a throttle is up to four, because the daemon reads the unit's
+current values before writing the old ones back. Retries for different
+records overlap, but D-Bus calls go one at a time.
 
-With the default `max_active_actions = 5`, that's 743 s, and the unit's
-`TimeoutStopSec=780s` allows for it. If you raise `max_active_actions`, raise
-`TimeoutStopSec` in a drop-in too:
+So the budget is a judgement, not a bound. With the default
+`max_active_actions = 5` and one timed-out call per attempt, a stop takes
+243 s + 5 × 100 s = 743 s, and the unit's `TimeoutStopSec=780s` allows for
+that. If systemd stops answering altogether, five throttles could in theory
+need far longer. If systemd kills the daemon first, those actions stay in
+force until it starts again. Their records are still open in the journal,
+and replay rolls them back before anything else runs (see
+[crash recovery](#crash-recovery)).
+
+If you raise `max_active_actions`, raise `TimeoutStopSec` in a drop-in too:
 
 ```ini
 # /etc/systemd/system/sentry-v2.service.d/stop-timeout.conf
@@ -157,8 +170,9 @@ new incident can race with a leftover action:
 - An interrupted `backup_reload` is marked `failed` with `interrupted`.
 - A `rollback_failed` record is not retried. Its target stays blocked until
   you act (next section).
-- Closed records older than 7 days are compacted away. `rollback_failed`
-  records are kept at any age.
+- Closed records older than 7 days are compacted away, here and then once
+  a day while the daemon runs. `rollback_failed` records are kept at any
+  age.
 
 A crash halfway through writing a line leaves a partial last line, which is
 cut off with a warning. Throttles are runtime-only, so a reboot clears them
