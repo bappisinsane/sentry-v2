@@ -1,11 +1,16 @@
 VENV ?= .venv
 BIN := $(VENV)/bin
 
-.PHONY: lint format typecheck test itest clean
+.PHONY: lint schema format typecheck test itest clean
 
 lint:
 	$(BIN)/ruff check .
 	$(BIN)/ruff format --check .
+	$(MAKE) schema
+
+schema:
+	f=$$(mktemp) && SENTRY_BUNDLE_SAMPLE=$$f $(BIN)/pytest tests/unit/test_bundle.py -q -k sample --no-cov \
+		&& $(BIN)/check-jsonschema --schemafile docs/reference/bundle.schema.json $$f; rc=$$?; rm -f $$f; exit $$rc
 
 format:
 	$(BIN)/ruff check --fix .
