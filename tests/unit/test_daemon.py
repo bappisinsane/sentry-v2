@@ -482,6 +482,26 @@ def test_pause_resume_rollback_and_psi(env: Env) -> None:
     drive(d, body)
 
 
+def test_samples_of_vanished_cgroups_age_out_quickly(env: Env) -> None:
+    # The collector samples every live trigger every 5s, so a sample 20s old
+    # belongs to a cgroup that has gone; psi and the metrics must drop it.
+    d = env.daemon()
+
+    def sample(cgroup: str, age_s: float) -> PsiEvent:
+        return PsiEvent(
+            ts_us=now_us() - int(age_s * 1_000_000), cgroup=cgroup, resource="cpu",
+            kind="some", avg10=40.0, avg60=20.0, avg300=5.0, total_us=1, triggered=False,
+        )  # fmt: skip
+
+    async def body() -> None:
+        d.samples[("gone.service", "cpu", "some")] = sample("gone.service", 20)
+        d.samples[("live.service", "cpu", "some")] = sample("live.service", 1)
+        await wait_for(lambda: ("gone.service", "cpu", "some") not in d.samples)
+        assert [r["cgroup"] for r in (await d.commands.psi({}))["cgroups"]] == ["live.service"]
+
+    drive(d, body)
+
+
 def test_rollback_by_id(env: Env) -> None:
     env.mgr.units["nginx.service"] = dataclasses.replace(NGINX, memory_high=1)
     d = env.daemon()
@@ -570,6 +590,29 @@ def test_restore(env: Env) -> None:
         (backups / backup_id / "MANIFEST.sha256").write_text("abc  files/../../../etc/passwd\n")
         with pytest.raises(CommandError, match="manifest is malformed"):
             await cmd.restore({"backup_id": backup_id})
+
+    drive(d, body)
+
+
+def test_restore_does_not_copy_the_backups_label(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    # copystat would stamp the backup's SELinux label on the restored unit
+    # file, and the daemon's domain may not relabel files anyway
+    def denied(*_a: object, **_k: object) -> None:
+        raise PermissionError(13, "Permission denied", "security.selinux")
+
+    unit_file = env.root / "etc" / "demo.service"
+    unit_file.parent.mkdir()
+    unit_file.write_text("[Service]\n")
+    os.utime(unit_file, (1000, 1000))
+    d = env.daemon()
+    backup_id = actions.backup("demo.service", [str(unit_file)], d.executor.backups_dir, 0.0)
+    unit_file.write_text("broken")
+    monkeypatch.setattr(shutil, "copystat", denied)
+
+    async def body() -> None:
+        assert (await d.commands.restore({"backup_id": backup_id}))["restored"] == [str(unit_file)]
+        assert unit_file.read_text() == "[Service]\n"
+        assert unit_file.stat().st_mtime == 1000
 
     drive(d, body)
 

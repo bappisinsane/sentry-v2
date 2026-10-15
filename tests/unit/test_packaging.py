@@ -44,7 +44,7 @@ def test_unit_file_hardening() -> None:
         "MemoryDenyWriteExecute": "yes",
         "SystemCallFilter": "@system-service",
         "RestrictAddressFamilies": "AF_UNIX AF_NETLINK AF_INET AF_INET6",
-        "CapabilityBoundingSet": "CAP_AUDIT_READ CAP_SYS_PTRACE CAP_DAC_READ_SEARCH",
+        "CapabilityBoundingSet": "CAP_AUDIT_READ",
         "StateDirectoryMode": "0700",
         "RuntimeDirectoryMode": "0750",
         "MemoryMax": "192M",
@@ -52,7 +52,12 @@ def test_unit_file_hardening() -> None:
     }
     assert {k: svc.get(k) for k in expected} == expected
     assert "ExecReload" not in svc  # notify-reload sends SIGHUP itself
-    assert set(svc["ReadWritePaths"].split()) == {"/var/lib/sentry-v2", "/sys/fs/cgroup"}
+    assert set(svc["ReadWritePaths"].split()) == {
+        "/var/lib/sentry-v2",
+        "/sys/fs/cgroup",
+        "-/etc/systemd/system",
+        "-/run/systemd/system",
+    }
     assert unit["Install"]["WantedBy"] == "multi-user.target"
 
 
