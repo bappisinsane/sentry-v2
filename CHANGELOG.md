@@ -26,6 +26,13 @@ All notable changes to Sentry-v2 are recorded here. The format follows
   drops as `audit` events dropped, and shows `overruns` and `rcvbuf` in the
   audit collector's health.
 
+### Changed
+
+- Actions on `.slice` units are refused unless `protection.allow_slices`
+  is true. A throttle or freeze on a slice reaches every unit under it, so
+  a broad `cgroups` pattern could squeeze far more than one noisy job. If
+  a policy of yours throttles a slice on purpose, set it before upgrading.
+
 ## [0.1.0] - 2026-10-15
 
 The first release.
