@@ -12,6 +12,7 @@ import errno
 import logging
 import os
 import re
+import select
 import socket
 import struct
 import time
@@ -158,6 +159,10 @@ class AvcAssembler:
         self._groups.setdefault(rec.serial, (now, []))[1].append(rec)
         return []
 
+    def oldest_pending_us(self) -> int | None:
+        """Audit time of the oldest record group still waiting for the rest."""
+        return min((recs[0].ts_us for _t, recs in self._groups.values()), default=None)
+
     def flush(self, now: float) -> list[AvcEvent]:
         due = [s for s, (t, _) in self._groups.items() if now - t >= self._flush_after]
         return [ev for s in due for ev in self._build(self._groups.pop(s)[1])]
@@ -211,6 +216,10 @@ class Source(Protocol):
 
     def records(self) -> AsyncGenerator[AuditRecord, None]: ...
 
+    def caught_up(self) -> float | None:
+        """Wall time up to which every record has been yielded, if it is now."""
+        ...
+
     def close(self) -> None: ...
 
 
@@ -220,6 +229,11 @@ class NetlinkSource:
     max_queued = 10_000
     dropped = 0  # records shed because the queue below was full
     overruns = 0  # ENOBUFS: the kernel dropped records before we read them
+    quiet_after = 1.0  # seconds without a message before "caught up" means now
+    _q: asyncio.Queue[AuditRecord | OSError] | None = None
+    _seen_us = 0  # newest audit stamp read off the socket, of any record type
+    _yielded_us = 0  # newest stamp handed on
+    _last_msg = float("-inf")  # monotonic time of the last message read
 
     def __init__(self) -> None:
         af = getattr(socket, "AF_NETLINK", None)
@@ -236,6 +250,26 @@ class NetlinkSource:
             self._sock.close()
             raise
 
+    def caught_up(self) -> float | None:
+        """The audit time up to which every record has been handed on.
+
+        The kernel sends records in order, but in a denial storm its own
+        queue can run seconds behind, so an empty socket proves nothing.
+        The newest stamp read does: everything older has been read. Only
+        after a quiet second with nothing waiting is it simply now.
+        """
+        if self._q is None:
+            return None
+        if not self._q.empty():
+            return self._yielded_us / 1_000_000 if self._yielded_us else None
+        if time.monotonic() - self._last_msg >= self.quiet_after:
+            try:
+                if not select.select([self._sock], [], [], 0)[0]:
+                    return time.time()
+            except (OSError, ValueError):
+                pass
+        return self._seen_us / 1_000_000 if self._seen_us else None
+
     @property
     def rcvbuf(self) -> int:
         """The receive buffer the kernel granted, in bytes."""
@@ -251,6 +285,7 @@ class NetlinkSource:
     async def records(self) -> AsyncGenerator[AuditRecord, None]:
         loop = self._loop = asyncio.get_running_loop()
         q: asyncio.Queue[AuditRecord | OSError] = asyncio.Queue(self.max_queued)
+        self._q = q
 
         def push(item: AuditRecord | OSError) -> None:
             if q.full():
@@ -275,7 +310,10 @@ class NetlinkSource:
                     loop.remove_reader(self._sock.fileno())
                     push(e)
                     return
+                self._last_msg = time.monotonic()
                 for mtype, text in parse_netlink(buf):
+                    if m := _STAMP.match(text):
+                        self._seen_us = max(self._seen_us, int(m[1]) * 1_000_000 + int(m[2]) * 1000)
                     if (name := NETLINK_TYPES.get(mtype)) and (rec := parse_audit_text(name, text)):
                         push(rec)
 
@@ -285,6 +323,7 @@ class NetlinkSource:
                 item = await q.get()
                 if isinstance(item, OSError):
                     raise item
+                self._yielded_us = max(self._yielded_us, item.ts_us)
                 yield item
         finally:
             self.close()
@@ -298,9 +337,17 @@ class LogTailSource:
         self._path = path
         self._interval = interval
         self.error: str | None = None
+        self._read_to_eof_at: float | None = None  # set while idle after a full read
+        self._yielded_us = 0
 
     def close(self) -> None:
         pass  # the file handle is released when records() is closed
+
+    def caught_up(self) -> float | None:
+        """When the file was last read to its end, or else the newest stamp handed on."""
+        if self._read_to_eof_at is not None:
+            return self._read_to_eof_at
+        return self._yielded_us / 1_000_000 if self._yielded_us else None
 
     def _fail(self, e: OSError) -> None:
         if self.error is None:
@@ -350,6 +397,7 @@ class LogTailSource:
                         *lines, buf = buf.split(b"\n")  # last item is a partial line
                         for line in lines:
                             if rec := self._parse(line.decode("utf-8", "replace")):
+                                self._yielded_us = max(self._yielded_us, rec.ts_us)
                                 yield rec
                         if len(buf) > self.max_partial:
                             log.warning("audit log line over %d bytes; dropped", self.max_partial)
@@ -371,7 +419,10 @@ class LogTailSource:
                             fh.close()
                             fh = None
                         self._fail(e)
+                if self.error is None and not buf:
+                    self._read_to_eof_at = time.time()
                 await asyncio.sleep(self._interval)
+                self._read_to_eof_at = None
         finally:
             if fh is not None:
                 fh.close()
@@ -413,6 +464,8 @@ class AuditCollector:
         self._asm = AvcAssembler()
         self._source: Source | None = None
         self._lost = 0
+        # audit time (µs) up to which every record has been published to the queue
+        self.caught_up_us: int | None = None
 
     def health(self) -> dict[str, object]:
         out: dict[str, object] = {
@@ -452,8 +505,18 @@ class AuditCollector:
             try:
                 self._publish(self._asm.flush(self._now()))
                 self._count_lost()
+                self._note_caught_up()
             except Exception:
                 log.exception("audit flush failed")
+
+    def _note_caught_up(self) -> None:
+        caught_up = getattr(self._source, "caught_up", None)
+        if caught_up is None or (t := caught_up()) is None:
+            return
+        us = int(t * 1_000_000)
+        if (oldest := self._asm.oldest_pending_us()) is not None:
+            us = min(us, oldest - 1)  # that group's events aren't published yet
+        self.caught_up_us = us
 
     async def run(self) -> None:
         self._source = source = self._factory()
