@@ -354,6 +354,8 @@ class MetricsServer:
                 else:
                     await self._respond(writer, 200, body, CONTENT_TYPE)
         except (ConnectionError, OSError):
-            pass
+            # A write timed out: drop the buffered reply and close the socket
+            # at once instead of waiting for the buffer to flush.
+            writer.transport.abort()
         finally:
             writer.close()
